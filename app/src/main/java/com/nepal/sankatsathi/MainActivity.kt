@@ -5,7 +5,6 @@ import android.app.Activity
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.bluetooth.BluetoothAdapter
-import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.Intent
@@ -19,6 +18,7 @@ import android.location.Location
 import android.media.AudioAttributes
 import android.media.Ringtone
 import android.media.RingtoneManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.CountDownTimer
@@ -39,7 +39,10 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material3.*
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -99,7 +102,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private val CHANNEL_ID = "ICE_MEDICAL_CARD_CHANNEL"
 
-    private val bluetoothSignals = mutableStateMapOf<String, Pair<Int, Boolean>>() // Address -> (RSSI, isSankatSathi)
+    private val bluetoothSignals = mutableStateMapOf<String, SosDevice>() 
 
     private val bluetoothEnableLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -110,8 +113,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             Toast.makeText(this, "Bluetooth is required for Mesh SOS", Toast.LENGTH_LONG).show()
         }
     }
-
-    private val respondedSenders = mutableSetOf<String>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -127,35 +128,10 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }
 
         lifecycleScope.launch {
-            bleMeshManager.scanResults.collectLatest { result ->
-                val deviceName = result.device.name ?: "Unknown Device"
-                val deviceAddress = result.device.address
-                val rssi = result.rssi
-                
-                // Check if this device belongs to our Mesh
-                val isSankatSathi = result.scanRecord?.serviceData?.any { (uuid, _) ->
-                    uuid.toString().contains("feaa", ignoreCase = true)
-                } ?: false
-                
-                if (isSankatSathi) {
-                    bluetoothSignals["$deviceName ($deviceAddress)"] = Pair(rssi, true)
-                    
-                    // Auto-response feature: Connect and send location to the sender
-                    if (!respondedSenders.contains(deviceAddress)) {
-                        respondedSenders.add(deviceAddress)
-                        try {
-                            fusedLocationClient.lastLocation.addOnSuccessListener { location ->
-                                val locStr = if (location != null) {
-                                    "${location.latitude},${location.longitude}"
-                                } else "27.7172,85.3240" // Fallback
-                                
-                                Log.d("SankatSathi", "Auto-responding to SOS from $deviceAddress with location $locStr")
-                                bleMeshManager.connectAndSendLocation(result.device, locStr)
-                            }
-                        } catch (e: SecurityException) {
-                            Log.e("SankatSathi", "Location permission missing for auto-response")
-                        }
-                    }
+            bleMeshManager.detectedSosDevices.collectLatest { sosDevice ->
+                runOnUiThread {
+                    bluetoothSignals[sosDevice.device.address] = sosDevice
+                    Toast.makeText(this@MainActivity, "📍 SOS DEVICE DETECTED: ${sosDevice.name}", Toast.LENGTH_SHORT).show()
                 }
             }
         }
@@ -364,22 +340,21 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 "https://maps.google.com/?q=27.7172,85.3240 (Kathmandu Fallback Center)"
             }
             dispatchAlerts(locationString)
+
+            // Activate BLE Mesh Broadcasting with user name and location
+            val deviceName = sharedPreferences.getString("user_name", "User") ?: "User"
+            val bluetoothPermissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                arrayOf(Manifest.permission.BLUETOOTH_ADVERTISE, Manifest.permission.BLUETOOTH_CONNECT)
+            } else {
+                emptyArray()
+            }
+
+            if (hasPermissions(bluetoothPermissions)) {
+                checkAndEnableBluetooth()
+                bleMeshManager.startBroadcasting(deviceName, locationString)
+            }
         }.addOnFailureListener {
             dispatchAlerts("Location Error (GPS Signal Unstable)")
-        }
-
-        // Activate BLE Mesh Broadcasting
-        val deviceName = sharedPreferences.getString("user_name", "User") ?: "User"
-        
-        val bluetoothPermissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            arrayOf(Manifest.permission.BLUETOOTH_ADVERTISE, Manifest.permission.BLUETOOTH_CONNECT)
-        } else {
-            emptyArray()
-        }
-
-        if (hasPermissions(bluetoothPermissions)) {
-            checkAndEnableBluetooth()
-            bleMeshManager.startBroadcasting(deviceName)
         }
     }
 
@@ -535,11 +510,12 @@ fun MainAppNavigation(
     severity: Int,
     threshold: Float,
     sharedPrefs: SharedPreferences,
-    bluetoothSignals: Map<String, Pair<Int, Boolean>>,
+    bluetoothSignals: Map<String, SosDevice>,
     onCancel: () -> Unit,
     onProfileSaved: () -> Unit
 ) {
     var selectedTab by remember { mutableStateOf(0) }
+    val context = androidx.compose.ui.platform.LocalContext.current
 
     if (isCountingDown || sosTriggered) {
         CrashDetectorScreen(padding, currentG, maxG, isCountingDown, secondsLeft, sosTriggered, severity, threshold, onCancel)
@@ -547,48 +523,48 @@ fun MainAppNavigation(
         Column(modifier = Modifier.fillMaxSize().padding(padding)) {
             TabRow(selectedTabIndex = selectedTab) {
                 Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }, text = { Text("Sensor") })
-                Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }, text = { Text("Mesh Signals") })
+                Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }, text = { Text("SOS Mesh") })
                 Tab(selected = selectedTab == 2, onClick = { selectedTab = 2 }, text = { Text("ICE Profile") })
             }
             when (selectedTab) {
                 0 -> CrashDetectorScreen(PaddingValues(0.dp), currentG, maxG, isCountingDown, secondsLeft, sosTriggered, severity, threshold, onCancel)
-                1 -> MeshSignalScreen(bluetoothSignals)
+                1 -> MeshSignalScreen(bluetoothSignals) { locationUrl ->
+                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(locationUrl))
+                    context.startActivity(intent)
+                }
                 2 -> IceProfileScreen(sharedPrefs, onProfileSaved)
             }
         }
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun MeshSignalScreen(signals: Map<String, Pair<Int, Boolean>>) {
+fun MeshSignalScreen(signals: Map<String, SosDevice>, onLocationClick: (String) -> Unit) {
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Nearby Bluetooth Nodes", fontSize = 22.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-            // Pulse indicator to show scanning is active
-            Box(modifier = Modifier.size(12.dp).background(Color(0xFF00C853), shape = CircleShape))
+            Text("Active SOS Signals", fontSize = 22.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+            Box(modifier = Modifier.size(12.dp).background(Color.Red, shape = CircleShape))
         }
-        Text("Real-time signal strength (RSSI)", fontSize = 14.sp, color = Color.Gray)
+        Text("Found via unique SankatSathi UUID", fontSize = 14.sp, color = Color.Gray)
         Spacer(modifier = Modifier.height(16.dp))
         
         if (signals.isEmpty()) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    CircularProgressIndicator(modifier = Modifier.size(32.dp), strokeWidth = 2.dp)
+                    CircularProgressIndicator(modifier = Modifier.size(32.dp), color = Color.Red, strokeWidth = 2.dp)
                     Spacer(modifier = Modifier.height(16.dp))
-                    Text("Searching for nearby SOS signals...", textAlign = TextAlign.Center)
-                    Text("Ensure other phones are broadcasting SOS.", fontSize = 12.sp, color = Color.Gray)
+                    Text("Scanning for unique SOS nodes...", textAlign = TextAlign.Center)
                 }
             }
         } else {
             Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
-                signals.forEach { (device, data) ->
-                    val (rssi, isSankatSathi) = data
+                signals.values.forEach { sosDevice ->
                     Card(
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                        colors = CardDefaults.cardColors(
-                            containerColor = if (isSankatSathi) Color(0xFFE3F2FD) else MaterialTheme.colorScheme.surfaceVariant
-                        ),
-                        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFFFFEBEE)),
+                        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
+                        onClick = { sosDevice.location?.let { onLocationClick(it) } }
                     ) {
                         Row(
                             modifier = Modifier.padding(16.dp).fillMaxWidth(),
@@ -597,18 +573,20 @@ fun MeshSignalScreen(signals: Map<String, Pair<Int, Boolean>>) {
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
-                                    text = if (isSankatSathi) "🛡️ $device" else device,
-                                    fontWeight = if (isSankatSathi) FontWeight.Bold else FontWeight.Medium,
-                                    color = if (isSankatSathi) Color(0xFF1976D2) else Color.Unspecified
+                                    text = "🚨 VICTIM: ${sosDevice.name}",
+                                    fontWeight = FontWeight.Black,
+                                    color = Color(0xFFB71C1C),
+                                    fontSize = 18.sp
                                 )
-                                if (isSankatSathi) {
-                                    Text("SankatSathi Mesh Active", fontSize = 10.sp, color = Color(0xFF1976D2))
+                                Text("Tap to view location on Maps", fontSize = 12.sp, color = Color.DarkGray)
+                                if (sosDevice.location != null) {
+                                    Text("Location data verified via GATT", fontSize = 10.sp, color = Color(0xFF2E7D32))
                                 }
                             }
-                            Text(
-                                "${rssi} dBm",
-                                fontWeight = FontWeight.Bold,
-                                color = getSignalColor(rssi)
+                            Icon(
+                                imageVector = androidx.compose.material.icons.Icons.Default.LocationOn,
+                                contentDescription = "Location",
+                                tint = Color(0xFFB71C1C)
                             )
                         }
                     }
@@ -618,13 +596,6 @@ fun MeshSignalScreen(signals: Map<String, Pair<Int, Boolean>>) {
     }
 }
 
-fun getSignalColor(rssi: Int): Color {
-    return when {
-        rssi > -60 -> Color(0xFF00C853) // Green
-        rssi > -80 -> Color(0xFFFFAB00) // Orange
-        else -> Color.Red
-    }
-}
 
 @Composable
 fun IceProfileScreen(sharedPrefs: SharedPreferences, onProfileSaved: () -> Unit) {

@@ -5,12 +5,21 @@ import android.bluetooth.le.ScanResult
 import kotlinx.coroutines.flow.Flow
 
 interface IBleMeshManager {
-    fun startBroadcasting(uniqueId: String)
+    fun startBroadcasting(userName: String, location: String)
     fun stopBroadcasting()
     fun startScanning()
     fun stopScanning()
     fun isBleSupported(): Boolean
-    fun connectAndSendLocation(device: BluetoothDevice, location: String)
+    fun connectToDevice(device: BluetoothDevice)
     val scanResults: Flow<ScanResult>
-    val broadcastStatus: Flow<Pair<Boolean, String>> // Success, Message
+    val broadcastStatus: Flow<Pair<Boolean, String>>
+    val detectedSosDevices: Flow<SosDevice>
 }
+
+data class SosDevice(
+    val device: BluetoothDevice,
+    val name: String,
+    val location: String?,
+    val rssi: Int,
+    val timestamp: Long = System.currentTimeMillis()
+)
