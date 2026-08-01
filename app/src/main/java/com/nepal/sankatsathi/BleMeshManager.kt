@@ -38,6 +38,7 @@ class BleMeshManager(private val context: Context, private val onSosReceived: (S
 
     private var currentLocation: String = ""
     private var currentUserName: String = ""
+    private val processedAddresses = mutableMapOf<String, Long>()
 
     @SuppressLint("MissingPermission")
     override fun startBroadcasting(userName: String, location: String) {
@@ -78,6 +79,8 @@ class BleMeshManager(private val context: Context, private val onSosReceived: (S
     override fun startScanning() {
         if (bluetoothAdapter == null || !bluetoothAdapter!!.isEnabled) return
         scanner = bluetoothAdapter!!.bluetoothLeScanner ?: return
+        
+        processedAddresses.clear()
 
         val filter = ScanFilter.Builder()
             .setServiceUuid(ParcelUuid(SERVICE_UUID))
@@ -93,11 +96,6 @@ class BleMeshManager(private val context: Context, private val onSosReceived: (S
     @SuppressLint("MissingPermission")
     override fun stopScanning() {
         scanner?.stopScan(scanCallback)
-    }
-
-    @SuppressLint("MissingPermission")
-    override fun connectToDevice(device: BluetoothDevice) {
-        device.connectGatt(context, false, gattClientCallback)
     }
 
     @SuppressLint("MissingPermission")
@@ -143,57 +141,69 @@ class BleMeshManager(private val context: Context, private val onSosReceived: (S
 
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
+            val address = result.device.address
+            val now = System.currentTimeMillis()
+            
+            // Allow re-processing the same device every 10 seconds to catch location updates
+            if (processedAddresses.containsKey(address) && now - (processedAddresses[address] ?: 0L) < 10000) return
+            processedAddresses[address] = now
+
+            if (processedAddresses.size > 100) processedAddresses.clear()
+
             _scanResults.tryEmit(result)
             // Auto-connect to fetch details
             connectToDevice(result.device)
         }
     }
 
-    private val gattClientCallback = object : BluetoothGattCallback() {
-        private var tempName: String? = null
-        private var tempLocation: String? = null
+    @SuppressLint("MissingPermission")
+    override fun connectToDevice(device: BluetoothDevice) {
+        device.connectGatt(context, false, object : BluetoothGattCallback() {
+            private var tempName: String? = null
+            private var tempLocation: String? = null
 
-        @SuppressLint("MissingPermission")
-        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
-                gatt.discoverServices()
-            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                gatt.close()
+            @SuppressLint("MissingPermission")
+            override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+                if (newState == BluetoothProfile.STATE_CONNECTED) {
+                    gatt.discoverServices()
+                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    gatt.close()
+                }
             }
-        }
 
-        @SuppressLint("MissingPermission")
-        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                val service = gatt.getService(SERVICE_UUID)
-                service?.getCharacteristic(NAME_CHAR_UUID)?.let { gatt.readCharacteristic(it) }
+            @SuppressLint("MissingPermission")
+            override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    val service = gatt.getService(SERVICE_UUID)
+                    service?.getCharacteristic(NAME_CHAR_UUID)?.let { gatt.readCharacteristic(it) }
+                }
             }
-        }
 
-        @SuppressLint("MissingPermission")
-        @Suppress("DEPRECATION")
-        override fun onCharacteristicRead(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                when (characteristic.uuid) {
-                    NAME_CHAR_UUID -> {
-                        tempName = String(characteristic.value)
-                        gatt.getService(SERVICE_UUID)?.getCharacteristic(LOCATION_CHAR_UUID)?.let {
-                            gatt.readCharacteristic(it)
+            @SuppressLint("MissingPermission")
+            @Suppress("DEPRECATION")
+            override fun onCharacteristicRead(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    when (characteristic.uuid) {
+                        NAME_CHAR_UUID -> {
+                            tempName = String(characteristic.value)
+                            gatt.getService(SERVICE_UUID)?.getCharacteristic(LOCATION_CHAR_UUID)?.let {
+                                gatt.readCharacteristic(it)
+                            }
                         }
-                    }
-                    LOCATION_CHAR_UUID -> {
-                        tempLocation = String(characteristic.value)
-                        _detectedSosDevices.tryEmit(SosDevice(
-                            device = gatt.device,
-                            name = tempName ?: "Unknown",
-                            location = tempLocation,
-                            rssi = 0 // In a real app, you'd get this from ScanResult
-                        ))
-                        gatt.disconnect()
+                        LOCATION_CHAR_UUID -> {
+                            tempLocation = String(characteristic.value)
+                            _detectedSosDevices.tryEmit(SosDevice(
+                                device = gatt.device,
+                                name = tempName ?: "Unknown",
+                                location = tempLocation,
+                                rssi = 0 
+                            ))
+                            gatt.disconnect()
+                        }
                     }
                 }
             }
-        }
+        })
     }
 
     private val advertiseCallback = object : AdvertiseCallback() {
