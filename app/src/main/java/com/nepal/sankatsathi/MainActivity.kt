@@ -34,16 +34,28 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.animation.*
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.LocationOn
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.runtime.*
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -59,6 +71,8 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationServices
+import com.google.android.gms.nearby.Nearby
+import com.google.android.gms.nearby.connection.*
 import com.nepal.sankatsathi.ui.theme.SankatSathiTheme
 import java.util.Properties
 import jakarta.mail.Authenticator
@@ -85,6 +99,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var secondsRemaining = mutableStateOf(15)
     private var isSOSSent = mutableStateOf(false)
     private var severityLevel = mutableStateOf(1)
+    private var activeMeshType = mutableStateOf("None")
 
     private val WARNING_THRESHOLD = 4.5f
     private val SEVERE_THRESHOLD = 15.0f
@@ -101,7 +116,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private val CONFIG_SENDER_PASSWORD = "ybcx muix gsct gmvb" // Change this to your 16-character security key
 
     private val CHANNEL_ID = "ICE_MEDICAL_CARD_CHANNEL"
+    private val NEARBY_SERVICE_ID = "com.nepal.sankatsathi.SOS_MESH"
 
+    private lateinit var connectionsClient: ConnectionsClient
     private val bluetoothSignals = mutableStateMapOf<String, SosDevice>() 
 
     private val bluetoothEnableLauncher = registerForActivityResult(
@@ -123,6 +140,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sharedPreferences = getSharedPreferences("SankatSathi_Prefs", Context.MODE_PRIVATE)
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
         vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+        connectionsClient = Nearby.getConnectionsClient(this)
         bleMeshManager = BleMeshManager(this) { relayedPayload ->
             relayMeshSOS(relayedPayload)
         }
@@ -204,6 +222,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                             threshold = WARNING_THRESHOLD,
                             sharedPrefs = sharedPreferences,
                             bluetoothSignals = bluetoothSignals,
+                            meshType = activeMeshType.value,
                             onCancel = { cancelEmergencyProtocol() },
                             onProfileSaved = { showLockScreenNotification() }
                         )
@@ -315,15 +334,108 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         dispatchAlerts("", relayedPayload = "🚨 MESH RELAY SOS 🚨\n$payload\nRelayed by: $myName")
     }
 
+    private fun startSOSAdvertisingD2D(userName: String, location: String) {
+        val advertisingOptions = AdvertisingOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
+        connectionsClient.startAdvertising(
+            userName,
+            NEARBY_SERVICE_ID,
+            connectionLifecycleCallback,
+            advertisingOptions
+        ).addOnSuccessListener {
+            Log.d("D2D", "D2D Advertising started successfully")
+            updateMeshStatusBadge(isD2DActive = true)
+        }.addOnFailureListener {
+            Log.e("D2D", "D2D Advertising failed: ${it.message}")
+        }
+    }
+
+    private fun startSOSDiscoveryD2D() {
+        val discoveryOptions = DiscoveryOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
+        connectionsClient.startDiscovery(
+            NEARBY_SERVICE_ID,
+            endpointDiscoveryCallback,
+            discoveryOptions
+        ).addOnSuccessListener {
+            Log.d("D2D", "D2D Discovery started successfully")
+        }.addOnFailureListener {
+            Log.e("D2D", "D2D Discovery failed: ${it.message}")
+        }
+    }
+
+    private fun updateMeshStatusBadge(isBTActive: Boolean = false, isD2DActive: Boolean = false) {
+        // Since this might be called from different triggers, we should be careful.
+        // For simplicity, we'll check the managers' states or keep internal flags.
+        // However, following the user's logic of adding alongside:
+        val bt = if (isBTActive || isSOSSent.value) true else false // Approximate for now
+        val d2d = isD2DActive
+
+        activeMeshType.value = when {
+            bt && d2d -> "Dual Mesh Active (BT + D2D)"
+            d2d -> "D2D Nearby Mesh Active"
+            bt -> "Bluetooth Mesh Active"
+            else -> "None"
+        }
+    }
+
+    private val connectionLifecycleCallback = object : ConnectionLifecycleCallback() {
+        override fun onConnectionInitiated(endpointId: String, connectionInfo: ConnectionInfo) {
+            // Automatically accept the connection to share SOS details
+            connectionsClient.acceptConnection(endpointId, payloadCallback)
+        }
+
+        override fun onConnectionResult(endpointId: String, result: ConnectionResolution) {
+            if (result.status.isSuccess) {
+                Log.d("D2D", "Connected to endpoint: $endpointId")
+            }
+        }
+
+        override fun onDisconnected(endpointId: String) {
+            Log.d("D2D", "Disconnected from endpoint: $endpointId")
+        }
+    }
+
+    private val endpointDiscoveryCallback = object : EndpointDiscoveryCallback() {
+        override fun onEndpointFound(endpointId: String, info: DiscoveredEndpointInfo) {
+            Log.d("D2D", "SOS Endpoint found: ${info.endpointName}")
+            runOnUiThread {
+                Toast.makeText(this@MainActivity, "📍 D2D SOS DETECTED: ${info.endpointName}", Toast.LENGTH_SHORT).show()
+            }
+            // In a mesh, we could connect to fetch more details, but for now discovery is proof of signal
+            connectionsClient.requestConnection(
+                sharedPreferences.getString("user_name", "User") ?: "User",
+                endpointId,
+                connectionLifecycleCallback
+            )
+        }
+
+        override fun onEndpointLost(endpointId: String) {
+            Log.d("D2D", "Endpoint lost: $endpointId")
+        }
+    }
+
+    private val payloadCallback = object : PayloadCallback() {
+        override fun onPayloadReceived(endpointId: String, payload: Payload) {
+            if (payload.type == Payload.Type.BYTES) {
+                val data = payload.asBytes()?.let { String(it) } ?: return
+                Log.d("D2D", "Payload received: $data")
+                relayMeshSOS(data)
+            }
+        }
+
+        override fun onPayloadTransferUpdate(endpointId: String, update: PayloadTransferUpdate) {}
+    }
+
     private fun cancelEmergencyProtocol() {
         countdownTimer?.cancel()
         stopAlertSignals()
         bleMeshManager.stopBroadcasting()
+        connectionsClient.stopAdvertising()
         isCountdownActive.value = false
         isSOSSent.value = false
         secondsRemaining.value = 15
         maxGForceTracked.value = 1.0f
         severityLevel.value = 1
+        updateMeshStatusBadge(isBTActive = false, isD2DActive = false)
         Toast.makeText(this, "Emergency Protocol Cancelled.", Toast.LENGTH_SHORT).show()
     }
 
@@ -352,6 +464,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             if (hasPermissions(bluetoothPermissions)) {
                 checkAndEnableBluetooth()
                 bleMeshManager.startBroadcasting(deviceName, locationString)
+                startSOSAdvertisingD2D(deviceName, locationString)
+                updateMeshStatusBadge(isBTActive = true, isD2DActive = true)
             }
         }.addOnFailureListener {
             dispatchAlerts("Location Error (GPS Signal Unstable)")
@@ -489,6 +603,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
         if (ContextCompat.checkSelfPermission(this, scanPermission) == PackageManager.PERMISSION_GRANTED) {
             bleMeshManager.startScanning()
+            startSOSDiscoveryD2D()
         }
     }
     override fun onPause() { 
@@ -496,6 +611,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         if (isCountdownActive.value) cancelEmergencyProtocol()
         sensorManager.unregisterListener(this) 
         bleMeshManager.stopScanning()
+        connectionsClient.stopDiscovery()
     }
 }
 
@@ -511,91 +627,162 @@ fun MainAppNavigation(
     threshold: Float,
     sharedPrefs: SharedPreferences,
     bluetoothSignals: Map<String, SosDevice>,
+    meshType: String,
     onCancel: () -> Unit,
     onProfileSaved: () -> Unit
 ) {
-    var selectedTab by remember { mutableStateOf(0) }
+    var selectedTab by remember { mutableIntStateOf(0) }
     val context = androidx.compose.ui.platform.LocalContext.current
 
-    if (isCountingDown || sosTriggered) {
-        CrashDetectorScreen(padding, currentG, maxG, isCountingDown, secondsLeft, sosTriggered, severity, threshold, onCancel)
-    } else {
-        Column(modifier = Modifier.fillMaxSize().padding(padding)) {
-            TabRow(selectedTabIndex = selectedTab) {
-                Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }, text = { Text("Sensor") })
-                Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }, text = { Text("SOS Mesh") })
-                Tab(selected = selectedTab == 2, onClick = { selectedTab = 2 }, text = { Text("ICE Profile") })
-            }
-            when (selectedTab) {
-                0 -> CrashDetectorScreen(PaddingValues(0.dp), currentG, maxG, isCountingDown, secondsLeft, sosTriggered, severity, threshold, onCancel)
-                1 -> MeshSignalScreen(bluetoothSignals) { locationUrl ->
-                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(locationUrl))
-                    context.startActivity(intent)
-                }
-                2 -> IceProfileScreen(sharedPrefs, onProfileSaved)
-            }
-        }
-    }
-}
+    val navItems = listOf(
+        NavItem("Engine", Icons.Default.Speed, Icons.Default.Speed),
+        NavItem("Mesh", Icons.Default.Share, Icons.Default.Share),
+        NavItem("Profile", Icons.Default.Person, Icons.Default.Person)
+    )
 
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun MeshSignalScreen(signals: Map<String, SosDevice>, onLocationClick: (String) -> Unit) {
-    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Active SOS Signals", fontSize = 22.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-            Box(modifier = Modifier.size(12.dp).background(Color.Red, shape = CircleShape))
-        }
-        Text("Found via unique SankatSathi UUID", fontSize = 14.sp, color = Color.Gray)
-        Spacer(modifier = Modifier.height(16.dp))
-        
-        if (signals.isEmpty()) {
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    CircularProgressIndicator(modifier = Modifier.size(32.dp), color = Color.Red, strokeWidth = 2.dp)
-                    Spacer(modifier = Modifier.height(16.dp))
-                    Text("Scanning for unique SOS nodes...", textAlign = TextAlign.Center)
-                }
-            }
-        } else {
-            Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
-                signals.values.forEach { sosDevice ->
-                    Card(
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
-                        colors = CardDefaults.cardColors(containerColor = Color(0xFFFFEBEE)),
-                        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
-                        onClick = { sosDevice.location?.let { onLocationClick(it) } }
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(16.dp).fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = "🚨 VICTIM: ${sosDevice.name}",
-                                    fontWeight = FontWeight.Black,
-                                    color = Color(0xFFB71C1C),
-                                    fontSize = 18.sp
-                                )
-                                Text("Tap to view location on Maps", fontSize = 12.sp, color = Color.DarkGray)
-                                if (sosDevice.location != null) {
-                                    Text("Location data verified via GATT", fontSize = 10.sp, color = Color(0xFF2E7D32))
-                                }
-                            }
-                            Icon(
-                                imageVector = androidx.compose.material.icons.Icons.Default.LocationOn,
-                                contentDescription = "Location",
-                                tint = Color(0xFFB71C1C)
+    Scaffold(
+        bottomBar = {
+            if (!isCountingDown && !sosTriggered) {
+                NavigationBar(
+                    containerColor = MaterialTheme.colorScheme.surface,
+                    tonalElevation = 0.dp,
+                    modifier = Modifier.clip(RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp))
+                ) {
+                    navItems.forEachIndexed { index, item ->
+                        NavigationBarItem(
+                            selected = selectedTab == index,
+                            onClick = { selectedTab = index },
+                            icon = { Icon(if (selectedTab == index) item.selectedIcon else item.unselectedIcon, contentDescription = item.label) },
+                            label = { Text(item.label, style = MaterialTheme.typography.labelMedium) },
+                            colors = NavigationBarItemDefaults.colors(
+                                indicatorColor = MaterialTheme.colorScheme.primaryContainer
                             )
-                        }
+                        )
                     }
                 }
             }
         }
+    ) { scaffoldPadding ->
+        Box(modifier = Modifier.padding(scaffoldPadding)) {
+            AnimatedContent(
+                targetState = if (isCountingDown || sosTriggered) -1 else selectedTab,
+                transitionSpec = {
+                    fadeIn(animationSpec = tween(400)) togetherWith fadeOut(animationSpec = tween(400))
+                }, label = ""
+            ) { targetIndex ->
+                when (targetIndex) {
+                    -1 -> CrashDetectorScreen(padding, currentG, maxG, isCountingDown, secondsLeft, sosTriggered, severity, threshold, meshType, onCancel)
+                    0 -> CrashDetectorScreen(PaddingValues(0.dp), currentG, maxG, isCountingDown, secondsLeft, sosTriggered, severity, threshold, meshType, onCancel)
+                    1 -> MeshSignalScreen(bluetoothSignals) { locationUrl ->
+                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(locationUrl))
+                        context.startActivity(intent)
+                    }
+                    2 -> IceProfileScreen(sharedPrefs, onProfileSaved)
+                }
+            }
+        }
     }
 }
 
+data class NavItem(val label: String, val unselectedIcon: ImageVector, val selectedIcon: ImageVector)
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun MeshSignalScreen(signals: Map<String, SosDevice>, onLocationClick: (String) -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 24.dp)
+            .verticalScroll(rememberScrollState())
+    ) {
+        Spacer(modifier = Modifier.height(32.dp))
+        Text(
+            "Emergency Mesh",
+            style = MaterialTheme.typography.headlineMedium,
+            fontWeight = FontWeight.Bold
+        )
+        Text(
+            "Signals detected via unique SankatSathi protocol",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        
+        Spacer(modifier = Modifier.height(24.dp))
+
+        if (signals.isEmpty()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(300.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(48.dp),
+                        strokeWidth = 3.dp,
+                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.5f)
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text(
+                        "Scanning for signals...",
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        } else {
+            signals.values.forEach { sosDevice ->
+                ElevatedCard(
+                    onClick = { sosDevice.location?.let { onLocationClick(it) } },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 8.dp),
+                    shape = RoundedCornerShape(24.dp),
+                    colors = CardDefaults.elevatedCardColors(
+                        containerColor = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.7f)
+                    )
+                ) {
+                    Row(
+                        modifier = Modifier.padding(20.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Surface(
+                            shape = RoundedCornerShape(16.dp),
+                            color = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.size(52.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Warning,
+                                contentDescription = null,
+                                tint = Color.White,
+                                modifier = Modifier.padding(12.dp)
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(16.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                sosDevice.name,
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                "Critical Distress Detected",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onErrorContainer
+                            )
+                        }
+                        Icon(
+                            Icons.Default.KeyboardArrowRight,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onErrorContainer
+                        )
+                    }
+                }
+            }
+        }
+        Spacer(modifier = Modifier.height(32.dp))
+    }
+}
 
 @Composable
 fun IceProfileScreen(sharedPrefs: SharedPreferences, onProfileSaved: () -> Unit) {
@@ -604,26 +791,70 @@ fun IceProfileScreen(sharedPrefs: SharedPreferences, onProfileSaved: () -> Unit)
     var allergies by remember { mutableStateOf(sharedPrefs.getString("user_allergies", "") ?: "") }
 
     Column(
-        modifier = Modifier.fillMaxSize().padding(24.dp).verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 24.dp)
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(20.dp)
     ) {
-        Text("Offline Medical Identity Card", fontSize = 20.sp, fontWeight = FontWeight.Bold)
-        OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Full Name") }, modifier = Modifier.fillMaxWidth())
-        OutlinedTextField(value = bloodGroup, onValueChange = { bloodGroup = it }, label = { Text("Blood Group") }, modifier = Modifier.fillMaxWidth())
-        OutlinedTextField(value = allergies, onValueChange = { allergies = it }, label = { Text("Critical Allergies / Conditions") }, modifier = Modifier.fillMaxWidth())
+        Spacer(modifier = Modifier.height(32.dp))
+        Text(
+            "Medical Profile",
+            style = MaterialTheme.typography.headlineMedium,
+            fontWeight = FontWeight.Bold
+        )
+        Text(
+            "Your information is stored locally and pinned to the lock screen for first responders.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
 
-        Button(onClick = {
-            sharedPrefs.edit().apply {
-                putString("user_name", name)
-                putString("user_blood", bloodGroup)
-                putString("user_allergies", allergies)
-                apply()
-            }
-            onProfileSaved()
-        }, modifier = Modifier.fillMaxWidth().height(50.dp)) {
-            Text("Save Profile & Pin Alert UI")
+        OutlinedTextField(
+            value = name,
+            onValueChange = { name = it },
+            label = { Text("Full Name") },
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp),
+            leadingIcon = { Icon(Icons.Outlined.Person, null) }
+        )
+
+        OutlinedTextField(
+            value = bloodGroup,
+            onValueChange = { bloodGroup = it },
+            label = { Text("Blood Group") },
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp),
+            leadingIcon = { Icon(Icons.Default.Bloodtype, null) }
+        )
+
+        OutlinedTextField(
+            value = allergies,
+            onValueChange = { allergies = it },
+            label = { Text("Critical Allergies / Conditions") },
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp),
+            leadingIcon = { Icon(Icons.Default.Warning, null) },
+            minLines = 3
+        )
+
+        Button(
+            onClick = {
+                sharedPrefs.edit().apply {
+                    putString("user_name", name)
+                    putString("user_blood", bloodGroup)
+                    putString("user_allergies", allergies)
+                    apply()
+                }
+                onProfileSaved()
+            },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(64.dp),
+            shape = RoundedCornerShape(20.dp)
+        ) {
+            Text("Update Emergency ID", style = MaterialTheme.typography.titleMedium)
         }
+        Spacer(modifier = Modifier.height(32.dp))
     }
 }
 
@@ -646,47 +877,174 @@ fun CrashDetectorScreen(
     sosTriggered: Boolean,
     severity: Int,
     threshold: Float,
+    meshType: String,
     onCancel: () -> Unit
 ) {
-    val backgroundColor = when {
-        sosTriggered && severity == 2 -> Color(0xFF3E2723)
-        sosTriggered -> Color(0xFFB71C1C)
-        isCountingDown -> Color(0xFFFF9800)
-        else -> Color.White
+    val scale by animateFloatAsState(
+        targetValue = if (isCountingDown) 1.1f else 1.0f,
+        animationSpec = tween(500), label = ""
+    )
+
+    val surfaceColor = when {
+        sosTriggered && severity == 2 -> MaterialTheme.colorScheme.error
+        sosTriggered -> MaterialTheme.colorScheme.errorContainer
+        isCountingDown -> MaterialTheme.colorScheme.tertiaryContainer
+        else -> MaterialTheme.colorScheme.surface
     }
 
-    Column(modifier = Modifier.fillMaxSize().padding(padding).background(backgroundColor).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.SpaceEvenly) {
-        Text(text = "SankatSathi Intelligent Crisis Engine", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = if (isCountingDown || sosTriggered) Color.White else Color.DarkGray, textAlign = TextAlign.Center)
+    val contentColor = contentColorFor(surfaceColor)
 
-        if (!isCountingDown && !sosTriggered) {
-            Box(modifier = Modifier.size(180.dp).background(Color(0xFF00C853), shape = CircleShape), contentAlignment = Alignment.Center) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(text = String.format("%.2f G", currentG), color = Color.White, fontSize = 32.sp, fontWeight = FontWeight.ExtraBold)
-                    Text(text = "Live Force", color = Color.White.copy(alpha = 0.8f), fontSize = 14.sp)
-                }
-            }
-            Text(text = String.format("Peak Force Tracked: %.2f G", maxG), fontSize = 18.sp, color = Color.Black)
-        }
-
-        if (isCountingDown) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                Text(text = "CRASH DETECTED (STAGE 1)", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.ExtraBold)
-                Text(text = "$secondsLeft", color = Color.White, fontSize = 80.sp, fontWeight = FontWeight.Black)
-                Button(onClick = onCancel, colors = ButtonDefaults.buttonColors(containerColor = Color.White)) {
-                    Text("I AM OKAY (Cancel)", color = Color.Black)
-                }
-            }
-        }
-
-        if (sosTriggered) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                Text(
-                    text = if (severity == 2) "🚨 INSTANT DIRECT SOS SENT (>=15G SHOCK) 🚨" else "🚨 EMERGENCY PROTOCOL DISPATCHED 🚨",
-                    color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Black, textAlign = TextAlign.Center
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(
+                brush = Brush.verticalGradient(
+                    colors = listOf(surfaceColor, MaterialTheme.colorScheme.background)
                 )
-                Button(onClick = onCancel, colors = ButtonDefaults.buttonColors(containerColor = Color.White)) {
-                    Text("Reset System", color = Color.Red)
+            )
+            .padding(24.dp)
+    ) {
+        Column(
+            modifier = Modifier.fillMaxSize(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Spacer(modifier = Modifier.height(32.dp))
+                Text(
+                    text = "Intelligent Crisis Engine",
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = contentColor.copy(alpha = 0.8f)
+                )
+                
+                // Mesh Status Badge
+                if (meshType != "None") {
+                    Surface(
+                        color = MaterialTheme.colorScheme.secondaryContainer,
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.padding(top = 12.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                        ) {
+                            Box(modifier = Modifier.size(6.dp).background(MaterialTheme.colorScheme.secondary, RoundedCornerShape(3.dp)))
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = meshType.uppercase(),
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                            )
+                        }
+                    }
                 }
+            }
+
+            // Central Visualizer
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .size(280.dp)
+                    .scale(scale)
+            ) {
+                // Background decorative circles
+                repeat(3) { i ->
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .scale(1f - (i * 0.15f))
+                            .alpha(0.05f),
+                        shape = RoundedCornerShape(140.dp),
+                        color = contentColor
+                    ) {}
+                }
+
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    if (isCountingDown) {
+                        Text(
+                            text = secondsLeft.toString(),
+                            style = MaterialTheme.typography.displayLarge,
+                            fontWeight = FontWeight.Black,
+                            color = contentColor
+                        )
+                    } else if (sosTriggered) {
+                        Icon(
+                            imageVector = Icons.Default.Warning,
+                            contentDescription = null,
+                            modifier = Modifier.size(80.dp),
+                            tint = contentColor
+                        )
+                    } else {
+                        Text(
+                            text = String.format("%.1f", currentG),
+                            style = MaterialTheme.typography.displayLarge,
+                            fontWeight = FontWeight.Black,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Text(
+                            text = "LIVE G-FORCE",
+                            style = MaterialTheme.typography.labelLarge,
+                            letterSpacing = 2.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.6f)
+                        )
+                    }
+                }
+            }
+
+            // Bottom Actions & Info
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                if (!isCountingDown && !sosTriggered) {
+                    ElevatedCard(
+                        shape = RoundedCornerShape(24.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.elevatedCardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                        )
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(24.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Default.Info, null, tint = MaterialTheme.colorScheme.primary)
+                            Spacer(modifier = Modifier.width(16.dp))
+                            Column {
+                                Text("PEAK FORCE RECORDED", style = MaterialTheme.typography.labelMedium)
+                                Text(
+                                    String.format("%.2f G", maxG),
+                                    style = MaterialTheme.typography.titleLarge,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+                    }
+                }
+
+                if (isCountingDown || sosTriggered) {
+                    Button(
+                        onClick = onCancel,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(72.dp),
+                        shape = RoundedCornerShape(24.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = contentColor,
+                            contentColor = surfaceColor
+                        )
+                    ) {
+                        Text(
+                            text = if (isCountingDown) "I AM OKAY (CANCEL)" else "RESET SYSTEM",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(32.dp))
             }
         }
     }

@@ -61,7 +61,9 @@ dependencies {
     implementation(libs.androidx.compose.ui.graphics)
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.compose.material3)
+    implementation(libs.androidx.compose.material.icons.extended)
     implementation(libs.play.services.location)
+    implementation("com.google.android.gms:play-services-nearby:19.3.0")
 
     // Modern Android-optimized background email library
     implementation("com.sun.mail:jakarta.mail:2.0.1")
