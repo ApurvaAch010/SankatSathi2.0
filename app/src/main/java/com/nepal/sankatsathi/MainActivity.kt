@@ -103,6 +103,7 @@ import com.google.android.gms.nearby.Nearby
 import com.google.android.gms.nearby.connection.*
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
+import com.nepal.sankatsathi.crashdetection.CrashDetectionUtils
 import com.nepal.sankatsathi.goodsamaritan.*
 import com.nepal.sankatsathi.ui.theme.SankatSathiTheme
 import java.io.File
@@ -182,17 +183,23 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private val sosBroadcastReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == EmergencyService.ACTION_SOS_TRIGGERED) {
-                val gForce = intent.getFloatExtra(EmergencyService.EXTRA_GFORCE, 0f)
-                if (!isCountdownActive.value && !isSOSSent.value) {
-                    if (gForce >= SEVERE_THRESHOLD) {
-                        severityLevel.value = 2
+            when (intent?.action) {
+                com.nepal.sankatsathi.crashdetection.EmergencyOverlayActivity.ACTION_SOS_CONFIRM -> {
+                    if (!isSOSSent.value) {
                         isSOSSent.value = true
+                        isCountdownActive.value = false
+                        stopAlertSignals()
                         executeSOSProtocol()
-                    } else if (gForce >= WARNING_THRESHOLD) {
-                        severityLevel.value = 1
-                        startEmergencyCountdown()
                     }
+                }
+                com.nepal.sankatsathi.crashdetection.EmergencyOverlayActivity.ACTION_SOS_CANCEL -> {
+                    cancelEmergencyProtocol()
+                }
+                EmergencyService.ACTION_SOS_TRIGGERED -> {
+                    // We let EmergencyOverlayActivity handle the UI and countdown
+                    // but we can still show the G-Force on the dashboard if needed
+                    val gForce = intent.getFloatExtra(EmergencyService.EXTRA_GFORCE, 0f)
+                    if (gForce > maxGForceTracked.value) maxGForceTracked.value = gForce
                 }
             }
         }
@@ -243,6 +250,17 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         isBluetoothEnabled.value = bluetoothManager.adapter?.isEnabled == true
         registerReceiver(bluetoothStateReceiver, IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED))
+        
+        val sosFilter = IntentFilter().apply {
+            addAction(EmergencyService.ACTION_SOS_TRIGGERED)
+            addAction(com.nepal.sankatsathi.crashdetection.EmergencyOverlayActivity.ACTION_SOS_CONFIRM)
+            addAction(com.nepal.sankatsathi.crashdetection.EmergencyOverlayActivity.ACTION_SOS_CANCEL)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(sosBroadcastReceiver, sosFilter, Context.RECEIVER_EXPORTED)
+        } else {
+            registerReceiver(sosBroadcastReceiver, sosFilter)
+        }
 
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
@@ -358,6 +376,16 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                         launcher.launch(permissionsToRequest)
                     } else {
                         checkAndEnableBluetooth()
+                        // Start Persistent Crash Detection Service
+                        CrashDetectionUtils.startCrashService(this@MainActivity)
+                        
+                        // Check for Battery Optimization & Full Screen Intent
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                            CrashDetectionUtils.requestIgnoreBatteryOptimizations(this@MainActivity)
+                        }
+                        if (!CrashDetectionUtils.checkFullScreenIntentPermission(this@MainActivity)) {
+                            CrashDetectionUtils.requestFullScreenIntentPermission(this@MainActivity)
+                        }
                     }
                 }
 
@@ -628,14 +656,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
         if (gForce > maxGForceTracked.value) maxGForceTracked.value = gForce
 
-        if (gForce >= SEVERE_THRESHOLD) {
-            severityLevel.value = 2
-            isSOSSent.value = true
-            executeSOSProtocol()
-        } else if (gForce >= WARNING_THRESHOLD) {
-            severityLevel.value = 1
-            startEmergencyCountdown()
-        }
+        // INTERNAL COUNTDOWN REMOVED - BACKGROUND SERVICE HANDLES SOS OVERLAY
     }
 
     private fun startEmergencyCountdown() {
