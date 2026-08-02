@@ -23,6 +23,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.core.content.FileProvider
 import coil.compose.rememberAsyncImagePainter
 import java.io.File
@@ -251,14 +252,22 @@ fun ReportAccidentDialog(
 
                     Button(
                         onClick = {
-                            val file = File(context.cacheDir, "img_${System.currentTimeMillis()}.jpg")
-                            val uri = FileProvider.getUriForFile(
-                                context,
-                                "${context.packageName}.fileprovider",
-                                file
-                            )
-                            tempImageUri = uri
-                            cameraLauncher.launch(uri)
+                            try {
+                                val file = File(context.cacheDir, "SOS_${System.currentTimeMillis()}.jpg")
+                                if (file.exists()) file.delete()
+                                file.createNewFile()
+
+                                val uri = FileProvider.getUriForFile(
+                                    context,
+                                    "${context.packageName}.fileprovider",
+                                    file
+                                )
+                                tempImageUri = uri
+                                cameraLauncher.launch(uri)
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                                android.widget.Toast.makeText(context, "Camera Error: ${e.message}", android.widget.Toast.LENGTH_SHORT).show()
+                            }
                         }
                     ) {
                         Icon(Icons.Default.PhotoCamera, null)

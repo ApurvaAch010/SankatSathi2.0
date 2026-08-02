@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.bluetooth.*
 import android.bluetooth.le.*
 import android.content.Context
+import android.os.Build
 import android.os.ParcelUuid
 import android.util.Log
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -38,6 +39,7 @@ class BleMeshManager(private val context: Context, private val onSosReceived: (S
 
     private var currentLocation: String = ""
     private var currentUserName: String = ""
+    private var isScanning: Boolean = false
     private val processedAddresses = mutableMapOf<String, Long>()
 
     @SuppressLint("MissingPermission")
@@ -60,8 +62,9 @@ class BleMeshManager(private val context: Context, private val onSosReceived: (S
             .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
             .build()
 
+        // Include ID in scan record if possible, or just the UUID for discovery
         val data = AdvertiseData.Builder()
-            .setIncludeDeviceName(false)
+            .setIncludeDeviceName(true) // Enable this so scanner can see name immediately if supported
             .addServiceUuid(ParcelUuid(SERVICE_UUID))
             .build()
 
@@ -77,9 +80,11 @@ class BleMeshManager(private val context: Context, private val onSosReceived: (S
 
     @SuppressLint("MissingPermission")
     override fun startScanning() {
+        if (isScanning) return
         if (bluetoothAdapter == null || !bluetoothAdapter!!.isEnabled) return
         scanner = bluetoothAdapter!!.bluetoothLeScanner ?: return
         
+        isScanning = true
         processedAddresses.clear()
 
         val filter = ScanFilter.Builder()
@@ -95,7 +100,9 @@ class BleMeshManager(private val context: Context, private val onSosReceived: (S
 
     @SuppressLint("MissingPermission")
     override fun stopScanning() {
+        if (!isScanning) return
         scanner?.stopScan(scanCallback)
+        isScanning = false
     }
 
     @SuppressLint("MissingPermission")
@@ -144,8 +151,8 @@ class BleMeshManager(private val context: Context, private val onSosReceived: (S
             val address = result.device.address
             val now = System.currentTimeMillis()
             
-            // Allow re-processing the same device every 10 seconds to catch location updates
-            if (processedAddresses.containsKey(address) && now - (processedAddresses[address] ?: 0L) < 10000) return
+            // Allow re-processing the same device every 3 seconds to ensure we catch the signal
+            if (processedAddresses.containsKey(address) && now - (processedAddresses[address] ?: 0L) < 3000) return
             processedAddresses[address] = now
 
             if (processedAddresses.size > 100) processedAddresses.clear()
@@ -183,15 +190,26 @@ class BleMeshManager(private val context: Context, private val onSosReceived: (S
             @Suppress("DEPRECATION")
             override fun onCharacteristicRead(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
                 if (status == BluetoothGatt.GATT_SUCCESS) {
+                    val data = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        characteristic.value
+                    } else {
+                        characteristic.value
+                    }
+
+                    if (data == null) {
+                        gatt.disconnect()
+                        return
+                    }
+
                     when (characteristic.uuid) {
                         NAME_CHAR_UUID -> {
-                            tempName = String(characteristic.value)
+                            tempName = String(data)
                             gatt.getService(SERVICE_UUID)?.getCharacteristic(LOCATION_CHAR_UUID)?.let {
                                 gatt.readCharacteristic(it)
                             }
                         }
                         LOCATION_CHAR_UUID -> {
-                            tempLocation = String(characteristic.value)
+                            tempLocation = String(data)
                             _detectedSosDevices.tryEmit(SosDevice(
                                 device = gatt.device,
                                 name = tempName ?: "Unknown",
@@ -201,6 +219,8 @@ class BleMeshManager(private val context: Context, private val onSosReceived: (S
                             gatt.disconnect()
                         }
                     }
+                } else {
+                    gatt.disconnect()
                 }
             }
         })

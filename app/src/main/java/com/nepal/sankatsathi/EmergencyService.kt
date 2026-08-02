@@ -13,6 +13,7 @@ import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.os.Vibrator
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -29,6 +30,7 @@ class EmergencyService : Service(), SensorEventListener {
 
     private lateinit var sensorManager: SensorManager
     private var accelerometer: Sensor? = null
+    private var wakeLock: PowerManager.WakeLock? = null
     
     private val WARNING_THRESHOLD = 4.5f
     private val SEVERE_THRESHOLD = 15.0f
@@ -37,6 +39,10 @@ class EmergencyService : Service(), SensorEventListener {
         super.onCreate()
         createNotificationChannel()
         
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SankatSathi:SensorWakeLock")
+        wakeLock?.acquire()
+
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         
@@ -58,6 +64,11 @@ class EmergencyService : Service(), SensorEventListener {
             startForeground(NOTIFICATION_ID, notification)
         }
         
+        // Ensure sensor is registered if service was restarted
+        accelerometer?.let {
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
+        }
+        
         return START_STICKY
     }
 
@@ -72,7 +83,18 @@ class EmergencyService : Service(), SensorEventListener {
 
             if (gForce >= WARNING_THRESHOLD) {
                 Log.d("EmergencyService", "High G-Force detected in background: $gForce")
-                // Notify Activity to start countdown if it's open
+                
+                // Wake up the activity even if in background/locked
+                val sosIntent = Intent(this, MainActivity::class.java).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                    addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                    putExtra(EXTRA_GFORCE, gForce)
+                    putExtra("AUTO_TRIGGER_SOS", true)
+                }
+                startActivity(sosIntent)
+
+                // Notify Activity to start countdown if it's already active
                 val intent = Intent(ACTION_SOS_TRIGGERED)
                 intent.putExtra(EXTRA_GFORCE, gForce)
                 sendBroadcast(intent)
@@ -85,6 +107,9 @@ class EmergencyService : Service(), SensorEventListener {
     override fun onDestroy() {
         super.onDestroy()
         sensorManager.unregisterListener(this)
+        wakeLock?.let {
+            if (it.isHeld) it.release()
+        }
     }
 
     private fun createNotification(): Notification {

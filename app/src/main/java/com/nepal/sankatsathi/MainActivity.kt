@@ -168,6 +168,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var isAtSafezone = mutableStateOf(false)
 
     private var isBluetoothEnabled = mutableStateOf(false)
+    private var isDiscoveringD2D = false
     private var loginState = mutableStateOf(LoginState.CHOOSING_TYPE)
 
     private val bluetoothStateReceiver = object : BroadcastReceiver() {
@@ -242,13 +243,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         isBluetoothEnabled.value = bluetoothManager.adapter?.isEnabled == true
         registerReceiver(bluetoothStateReceiver, IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED))
-        
-        val filter = IntentFilter(EmergencyService.ACTION_SOS_TRIGGERED)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(sosBroadcastReceiver, filter, Context.RECEIVER_EXPORTED)
-        } else {
-            registerReceiver(sosBroadcastReceiver, filter)
-        }
 
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
@@ -312,7 +306,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             bleMeshManager.broadcastStatus.collect { (success, message) ->
                 // Keep alerts receiver-only for victim, but log the exact signal sent
                 runOnUiThread {
-                    if (success) {
+                    if (success && isSOSSent.value) { // ONLY SHOW TOAST IF SOS IS INTENTIONALLY ACTIVE
                         Log.d("SankatSathi", "SOS Signal Sent: $message")
                         Toast.makeText(this@MainActivity, "📤 SIGNAL SENT: $message", Toast.LENGTH_SHORT).show()
                     }
@@ -328,14 +322,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         showLockScreenNotification()
 
         performAutoLogin()
-
-        // Start Background Emergency Service
-        val serviceIntent = Intent(this, EmergencyService::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(serviceIntent)
-        } else {
-            startService(serviceIntent)
-        }
 
         setContent {
             SankatSathiTheme {
@@ -364,8 +350,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     permissionsGranted = results.values.all { it }
                     if (permissionsGranted) {
                         checkAndEnableBluetooth()
-                        requestBackgroundLocation()
-                        requestBatteryOptimizations()
                     }
                 }
 
@@ -374,8 +358,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                         launcher.launch(permissionsToRequest)
                     } else {
                         checkAndEnableBluetooth()
-                        requestBackgroundLocation()
-                        requestBatteryOptimizations()
                     }
                 }
 
@@ -528,31 +510,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }
     }
 
-    @SuppressLint("BatteryLife")
-    private fun requestBatteryOptimizations() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
-            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
-                val intent = Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                    data = Uri.parse("package:$packageName")
-                }
-                startActivity(intent)
-            }
-        }
-    }
-
-    private fun requestBackgroundLocation() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_BACKGROUND_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-                ActivityCompat.requestPermissions(
-                    this,
-                    arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION),
-                    2002
-                )
-            }
-        }
-    }
-
     @SuppressLint("MissingPermission")
     private fun startLocationTracking() {
         val locationRequest = com.google.android.gms.location.LocationRequest.Builder(
@@ -620,12 +577,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 
                 isDisasterNearby.value = nearby.any { it.distanceKm <= 10.0 }
                 
-                // Auto-enable Bluetooth if disaster is near
-                if (isDisasterNearby.value && !isBluetoothEnabled.value) {
-                    val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-                    bluetoothManager.adapter?.enable()
-                }
-                
             } catch (e: Exception) {
                 Log.e("SankatSathi", "NASA API Error: ${e.message}")
                 val cached = getCachedDisasterAlerts()
@@ -661,7 +612,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     }
 
     private fun handleCrashDetection(event: SensorEvent) {
-        if (isCountdownActive.value || isSOSSent.value) return
+        if (isCountdownActive.value || isSOSSent.value || loginState.value != LoginState.LOGGED_IN) return
 
         val x = event.values[0]
         val y = event.values[1]
@@ -669,15 +620,13 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
         val accelerationSum = sqrt((x * x + y * y + z * z).toDouble()).toFloat()
         val gForce = accelerationSum / SensorManager.GRAVITY_EARTH
-        currentGForce.value = gForce
+        
+        // Optimize UI updates: Only update if the change is significant to reduce recompositions
+        if (Math.abs(currentGForce.value - gForce) > 0.05f) {
+            currentGForce.value = gForce
+        }
 
         if (gForce > maxGForceTracked.value) maxGForceTracked.value = gForce
-
-        // Auto-enable Bluetooth in case of severe G-Force
-        if (gForce >= WARNING_THRESHOLD && !isBluetoothEnabled.value) {
-            val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-            bluetoothManager.adapter?.enable() // Note: enable() is deprecated but often works on older APIs for safety systems
-        }
 
         if (gForce >= SEVERE_THRESHOLD) {
             severityLevel.value = 2
@@ -762,6 +711,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     }
 
     private fun startSOSAdvertisingD2D(userName: String, location: String) {
+        if (location == "Unknown" || location.isEmpty()) {
+            Log.e("D2D", "D2D Mesh skipped: No valid location available yet")
+            return
+        }
+        
         val advertisingOptions = AdvertisingOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
         connectionsClient.startAdvertising(
             userName,
@@ -769,7 +723,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             connectionLifecycleCallback,
             advertisingOptions
         ).addOnSuccessListener {
-            Log.d("D2D", "D2D Advertising started successfully")
+            Log.d("D2D", "D2D Advertising started successfully with location")
             updateMeshStatusBadge(isD2DActive = true)
         }.addOnFailureListener {
             Log.e("D2D", "D2D Advertising failed: ${it.message}")
@@ -777,6 +731,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     }
 
     private fun startSOSDiscoveryD2D() {
+        if (isDiscoveringD2D) return
         val discoveryOptions = DiscoveryOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
         connectionsClient.startDiscovery(
             NEARBY_SERVICE_ID,
@@ -784,8 +739,10 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             discoveryOptions
         ).addOnSuccessListener {
             Log.d("D2D", "D2D Discovery started successfully")
+            isDiscoveringD2D = true
         }.addOnFailureListener {
             Log.e("D2D", "D2D Discovery failed: ${it.message}")
+            isDiscoveringD2D = false
         }
     }
 
@@ -813,6 +770,29 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         override fun onConnectionResult(endpointId: String, result: ConnectionResolution) {
             if (result.status.isSuccess) {
                 Log.d("D2D", "Connected to endpoint: $endpointId")
+                // IF WE ARE THE VICTIM AND SOS IS ACTIVE, SEND THE FULL SOS DETAILS TO THE MESH
+                if (isSOSSent.value) {
+                    val name = sharedPreferences.getString("user_name", "User") ?: "User"
+                    val phone = sharedPreferences.getString("user_phone", "000") ?: "000"
+                    val blood = sharedPreferences.getString("user_blood", "Not Set")
+                    val loc = if (userLocation.value != null) {
+                        "https://maps.google.com/?q=${userLocation.value?.latitude},${userLocation.value?.longitude}"
+                    } else "Unknown"
+                    
+                    // Construct the same unique mesh ID used for advertising
+                    val coords = if (loc.contains("?q=")) {
+                        loc.substringAfter("?q=").substringBefore(" ").split(",")
+                    } else null
+                    
+                    val victimId = if (coords != null && coords.size >= 2) {
+                        "$phone|$name|${coords[0].trim()}|${coords[1].trim()}"
+                    } else {
+                        "$phone|$name"
+                    }
+
+                    val payloadStr = "🚨 SOS MESH 🚨\nVictim: $victimId\nPhone: $phone\nBlood: $blood\nLoc: $loc"
+                    connectionsClient.sendPayload(endpointId, Payload.fromBytes(payloadStr.toByteArray()))
+                }
             }
         }
 
@@ -825,20 +805,27 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         override fun onEndpointFound(endpointId: String, info: DiscoveredEndpointInfo) {
             Log.d("D2D", "SOS Endpoint found: ${info.endpointName}")
             runOnUiThread {
-                // DEDUPLICATION FIX: Use the unique full name/ID as key for multiple victim support
                 val victimId = info.endpointName
+                val parts = victimId.split("|")
+                // Robust extraction: parts[2] is lat, parts[3] is lng
+                val locUrl = if (parts.size >= 4) {
+                    val lat = parts[2].trim()
+                    val lng = parts[3].trim()
+                    "https://maps.google.com/?q=$lat,$lng"
+                } else null
 
                 // Mock device for d2dSignals
                 val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
                 val dummyDevice = bluetoothManager.adapter.getRemoteDevice("00:00:00:00:00:00")
-                d2dSignals[victimId] = SosDevice(dummyDevice, info.endpointName, null, 0)
+                d2dSignals[victimId] = SosDevice(dummyDevice, victimId, locUrl, 0)
                 
                 triggerSOSVibration()
                 Toast.makeText(this@MainActivity, "📍 D2D SOS DETECTED: $victimId", Toast.LENGTH_SHORT).show()
             }
-            // In a mesh, we could connect to fetch more details, but for now discovery is proof of signal
+            
+            // ALWAYS request connection in D2D mesh to ensure full payload (Blood group, etc) is received
             connectionsClient.requestConnection(
-                sharedPreferences.getString("user_name", "User") ?: "User",
+                sharedPreferences.getString("user_name", "Rescuer") ?: "Rescuer",
                 endpointId,
                 connectionLifecycleCallback
             )
@@ -857,14 +844,12 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 
                 // Try to parse location from payload if it matches D2D SOS pattern
                 if (data.contains("Loc:")) {
-                    val name = data.substringAfter("Victim: ").substringBefore("\n")
-                    val loc = data.substringAfter("Loc: ").substringBefore("\n")
-                    
-                    val victimId = name
+                    val victimId = data.substringAfter("Victim: ").substringBefore("\n").trim()
+                    val loc = data.substringAfter("Loc: ").substringBefore("\n").trim()
                     
                     val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
                     val dummyDevice = bluetoothManager.adapter.getRemoteDevice("00:00:00:00:00:00")
-                    d2dSignals[victimId] = SosDevice(dummyDevice, name, loc, 0)
+                    d2dSignals[victimId] = SosDevice(dummyDevice, victimId, loc, 0)
                 }
                 
                 relayMeshSOS(data)
@@ -901,6 +886,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private fun executeSOSProtocol() {
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
             dispatchAlerts("Unknown Location (Permissions Denied)")
+            // Still start broadcasting even without precise location
+            startBroadcastMesh("Unknown")
             return
         }
 
@@ -911,26 +898,49 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 "https://maps.google.com/?q=27.7172,85.3240 (Kathmandu Fallback Center)"
             }
             dispatchAlerts(locationString)
-
-            // Activate BLE Mesh Broadcasting with unique user ID and location
-            val userName = sharedPreferences.getString("user_name", "User") ?: "User"
-            val userPhone = sharedPreferences.getString("user_phone", "000") ?: "000"
-            val broadcastName = "$userPhone|$userName"
-
-            val bluetoothPermissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                arrayOf(Manifest.permission.BLUETOOTH_ADVERTISE, Manifest.permission.BLUETOOTH_CONNECT)
-            } else {
-                emptyArray()
-            }
-
-            if (hasPermissions(bluetoothPermissions)) {
-                checkAndEnableBluetooth()
-                bleMeshManager.startBroadcasting(broadcastName, locationString)
-                startSOSAdvertisingD2D(broadcastName, locationString)
-                updateMeshStatusBadge(isBTActive = true, isD2DActive = true)
-            }
+            startBroadcastMesh(locationString)
         }.addOnFailureListener {
             dispatchAlerts("Location Error (GPS Signal Unstable)")
+            startBroadcastMesh("Unknown")
+        }
+    }
+
+    private fun startBroadcastMesh(locationString: String) {
+        // Activate BLE Mesh Broadcasting with unique user ID and location
+        val userName = sharedPreferences.getString("user_name", "User") ?: "User"
+        val userPhone = sharedPreferences.getString("user_phone", "000") ?: "000"
+
+        // Extract Lat/Lng for compact discovery (Fast Path)
+        // locationString format: "https://maps.google.com/?q=LAT,LNG"
+        val coords = if (locationString.contains("?q=")) {
+            locationString.substringAfter("?q=").substringBefore(" ").split(",")
+        } else null
+        
+        val broadcastName = if (coords != null && coords.size >= 2) {
+            val lat = coords[0].trim()
+            val lng = coords[1].trim()
+            "$userPhone|$userName|$lat|$lng"
+        } else {
+            "$userPhone|$userName"
+        }
+
+        val bluetoothPermissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            arrayOf(Manifest.permission.BLUETOOTH_ADVERTISE, Manifest.permission.BLUETOOTH_CONNECT)
+        } else {
+            emptyArray()
+        }
+
+        if (hasPermissions(bluetoothPermissions)) {
+            checkAndEnableBluetooth()
+            // PRIORITIZE BLE FIRST (Broadcasting usually more reliable for initial blip)
+            bleMeshManager.startBroadcasting(broadcastName, locationString)
+            
+            // DELAY D2D TO ENSURE BLE IS BROADCASTING FIRST AND LOCATION IS STABLE
+            Handler(Looper.getMainLooper()).postDelayed({
+                startSOSAdvertisingD2D(broadcastName, locationString)
+            }, 5000) // Increased to 5s to ensure location lock is solid
+            
+            updateMeshStatusBadge(isBTActive = true, isD2DActive = false)
         }
     }
 
@@ -1080,8 +1090,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
     override fun onResume() { 
         super.onResume()
-        accelerometer?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI) } 
-        magnetometer?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI) }
+        accelerometer?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL) } 
+        magnetometer?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL) }
         
         // --- ADDED: Repeated Permission Check ---
         val permissionsToRequest = mutableListOf(
@@ -1127,9 +1137,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     override fun onPause() { 
         super.onPause()
         if (isCountdownActive.value) cancelEmergencyProtocol()
-        sensorManager.unregisterListener(this) 
-        bleMeshManager.stopScanning()
-        connectionsClient.stopDiscovery()
+        // We do NOT stop scanning here to allow background detection
+        // sensorManager.unregisterListener(this) // Keep sensors for crash detection?
     }
 }
 
@@ -1168,9 +1177,9 @@ fun MainAppNavigation(
     var selectedTab by remember { mutableIntStateOf(if (isProfileSet) 0 else 4) }
     var showSamaritanDialog by remember { mutableStateOf(false) }
     
-    // Auto-switch to Safezone tab if disaster is within 10km or simulation started
-    LaunchedEffect(isDisasterClose, isDisaster) {
-        if (isDisasterClose || isDisaster) {
+    // Auto-switch to Safezone tab ONLY if a REAL NASA disaster is within 10km
+    LaunchedEffect(isDisasterClose) {
+        if (isDisasterClose) {
             selectedTab = 3 // Index for Safezone tab
         }
     }
@@ -1212,7 +1221,8 @@ fun MainAppNavigation(
             AnimatedContent(
                 targetState = when {
                     !isProfileSet -> 4
-                    isCountingDown || (sosTriggered && !isDisaster) -> -1
+                    isCountingDown -> -1
+                    sosTriggered && !isDisaster -> -1
                     else -> selectedTab
                 },
                 transitionSpec = {
@@ -1220,15 +1230,15 @@ fun MainAppNavigation(
                 }, label = ""
             ) { targetIndex ->
                 when (targetIndex) {
-                    -1 -> CrashDetectorScreen(padding, currentG, maxG, isCountingDown, secondsLeft, sosTriggered, severity, threshold, meshType, disasterAlerts, onCancel, { showSamaritanDialog = true })
-                    0 -> CrashDetectorScreen(PaddingValues(0.dp), currentG, maxG, isCountingDown, secondsLeft, sosTriggered, severity, threshold, meshType, disasterAlerts, onCancel, { showSamaritanDialog = true })
+                    -1 -> CrashDetectorScreen(padding, currentG, maxG, isCountingDown, secondsLeft, sosTriggered, isDisaster, severity, threshold, meshType, disasterAlerts, onCancel, { selectedTab = 3 }, { showSamaritanDialog = true })
+                    0 -> CrashDetectorScreen(PaddingValues(0.dp), currentG, maxG, isCountingDown, secondsLeft, sosTriggered, isDisaster, severity, threshold, meshType, disasterAlerts, onCancel, { selectedTab = 3 }, { showSamaritanDialog = true })
                     1 -> MeshSignalScreen(bluetoothSignals, d2dSignals) { locationUrl ->
                         val intent = Intent(Intent.ACTION_VIEW, Uri.parse(locationUrl))
                         context.startActivity(intent)
                     }
                     2 -> SimulationScreen(sosTriggered, { 
                         onSimulate() 
-                        selectedTab = 3 // Switch to Safezone
+                        selectedTab = 0 // Show Crisis Engine screen first
                     }, onCancel)
                     3 -> SafezoneNavigationScreen(userLoc, deviceAzimuth, safezone, isArrivedAtSafezone, onUpdateSafezone, onManualSafezone)
                     4 -> IceProfileScreen(sharedPrefs, samaritanPoints, samaritanReports, onLogout, onProfileSaved)
@@ -1257,6 +1267,21 @@ fun MeshSignalScreen(
     d2dSignals: Map<String, SosDevice>,
     onLocationClick: (String) -> Unit
 ) {
+    // Unify and deduplicate signals from both mesh types
+    val unifiedSignals = remember(bleSignals, d2dSignals) {
+        val merged = mutableMapOf<String, SosDevice>()
+        // D2D usually has better details if connected
+        merged.putAll(d2dSignals)
+        // BLE signals might overwrite with fresh data
+        bleSignals.forEach { (id, device) ->
+            val existing = merged[id]
+            if (existing == null || device.location != null) {
+                merged[id] = device
+            }
+        }
+        merged
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -1270,14 +1295,14 @@ fun MeshSignalScreen(
             fontWeight = FontWeight.Bold
         )
         Text(
-            "Signals detected via unique SankatSathi protocol",
+            "Signals detected via unique protocol",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
 
         Spacer(modifier = Modifier.height(24.dp))
 
-        if (bleSignals.isEmpty() && d2dSignals.isEmpty()) {
+        if (unifiedSignals.isEmpty()) {
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1299,31 +1324,22 @@ fun MeshSignalScreen(
                 }
             }
         } else {
-            if (d2dSignals.isNotEmpty()) {
-                Text(
-                    "Nearby D2D Signals",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.padding(vertical = 8.dp)
-                )
-                d2dSignals.values.forEach { sosDevice ->
-                    SosSignalCard(sosDevice, "D2D Mesh", onLocationClick)
+            Text(
+                "Nearby Distress Signals",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.padding(vertical = 8.dp)
+            )
+            unifiedSignals.values.sortedByDescending { it.timestamp }.forEach { sosDevice ->
+                val type = if (d2dSignals.containsKey(sosDevice.name) && bleSignals.containsKey(sosDevice.name)) {
+                    "Dual Mesh"
+                } else if (d2dSignals.containsKey(sosDevice.name)) {
+                    "D2D Nearby"
+                } else {
+                    "BLE Mesh"
                 }
-                Spacer(modifier = Modifier.height(16.dp))
-            }
-
-            if (bleSignals.isNotEmpty()) {
-                Text(
-                    "Bluetooth LE Signals",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.secondary,
-                    modifier = Modifier.padding(vertical = 8.dp)
-                )
-                bleSignals.values.forEach { sosDevice ->
-                    SosSignalCard(sosDevice, "BLE Mesh", onLocationClick)
-                }
+                SosSignalCard(sosDevice, type, onLocationClick)
             }
         }
         Spacer(modifier = Modifier.height(32.dp))
@@ -1362,7 +1378,8 @@ fun SosSignalCard(sosDevice: SosDevice, type: String, onLocationClick: (String) 
             Spacer(modifier = Modifier.width(16.dp))
             Column(modifier = Modifier.weight(1f)) {
                 val displayName = if (sosDevice.name.contains("|")) {
-                    sosDevice.name.substringAfter("|")
+                    val parts = sosDevice.name.split("|")
+                    if (parts.size >= 2) parts[1] else sosDevice.name
                 } else {
                     sosDevice.name
                 }
@@ -2202,11 +2219,13 @@ fun CrashDetectorScreen(
     isCountingDown: Boolean,
     secondsLeft: Int,
     sosTriggered: Boolean,
+    isDisaster: Boolean,
     severity: Int,
     threshold: Float,
     meshType: String,
     disasterAlerts: List<DisasterAlert>,
     onCancel: () -> Unit,
+    onNavigateToSafezone: () -> Unit,
     onReportAccident: () -> Unit
 ) {
     val scale by animateFloatAsState(
@@ -2378,7 +2397,13 @@ fun CrashDetectorScreen(
 
                 if (isCountingDown || sosTriggered) {
                     Button(
-                        onClick = onCancel,
+                        onClick = {
+                            if (sosTriggered && isDisaster) {
+                                onNavigateToSafezone()
+                            } else {
+                                onCancel()
+                            }
+                        },
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(72.dp),
@@ -2389,7 +2414,11 @@ fun CrashDetectorScreen(
                         )
                     ) {
                         Text(
-                            text = if (isCountingDown) "I AM OKAY (CANCEL)" else "RESET SYSTEM",
+                            text = when {
+                                isCountingDown -> "I AM OKAY (CANCEL)"
+                                sosTriggered && isDisaster -> "NAVIGATE TO SAFEZONE"
+                                else -> "RESET SYSTEM"
+                            },
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold
                         )
