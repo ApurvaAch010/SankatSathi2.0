@@ -27,6 +27,7 @@ class BleMeshManager(private val context: Context, private val onSosReceived: (S
     private val SERVICE_UUID = UUID.fromString("550e8400-e29b-41d4-a716-446655440000")
     private val LOCATION_CHAR_UUID = UUID.fromString("550e8400-e29b-41d4-a716-446655440001")
     private val NAME_CHAR_UUID = UUID.fromString("550e8400-e29b-41d4-a716-446655440002")
+    private val SOS_PAYLOAD_CHAR_UUID = UUID.fromString("550e8400-e29b-41d4-a716-446655440003")
 
     private val _scanResults = MutableSharedFlow<ScanResult>(extraBufferCapacity = 10)
     override val scanResults: SharedFlow<ScanResult> = _scanResults.asSharedFlow()
@@ -39,13 +40,15 @@ class BleMeshManager(private val context: Context, private val onSosReceived: (S
 
     private var currentLocation: String = ""
     private var currentUserName: String = ""
+    private var currentCompressedPayload: String = ""
     private var isScanning: Boolean = false
     private val processedAddresses = mutableMapOf<String, Long>()
 
     @SuppressLint("MissingPermission")
-    override fun startBroadcasting(userName: String, location: String) {
+    override fun startBroadcasting(userName: String, location: String, compressedPayload: String?) {
         currentUserName = userName
         currentLocation = location
+        currentCompressedPayload = compressedPayload ?: ""
 
         if (bluetoothAdapter == null || !bluetoothAdapter!!.isEnabled) {
             _broadcastStatus.tryEmit(false to "Bluetooth Error")
@@ -124,8 +127,15 @@ class BleMeshManager(private val context: Context, private val onSosReceived: (S
             BluetoothGattCharacteristic.PERMISSION_READ
         )
 
+        val payloadChar = BluetoothGattCharacteristic(
+            SOS_PAYLOAD_CHAR_UUID,
+            BluetoothGattCharacteristic.PROPERTY_READ,
+            BluetoothGattCharacteristic.PERMISSION_READ
+        )
+
         service.addCharacteristic(locationChar)
         service.addCharacteristic(nameChar)
+        service.addCharacteristic(payloadChar)
         gattServer?.addService(service)
     }
 
@@ -140,6 +150,7 @@ class BleMeshManager(private val context: Context, private val onSosReceived: (S
             val value = when (characteristic.uuid) {
                 LOCATION_CHAR_UUID -> currentLocation.toByteArray()
                 NAME_CHAR_UUID -> currentUserName.toByteArray()
+                SOS_PAYLOAD_CHAR_UUID -> currentCompressedPayload.toByteArray()
                 else -> null
             }
             gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
@@ -168,6 +179,7 @@ class BleMeshManager(private val context: Context, private val onSosReceived: (S
         device.connectGatt(context, false, object : BluetoothGattCallback() {
             private var tempName: String? = null
             private var tempLocation: String? = null
+            private var tempPayload: String? = null
 
             @SuppressLint("MissingPermission")
             override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
@@ -204,6 +216,12 @@ class BleMeshManager(private val context: Context, private val onSosReceived: (S
                     when (characteristic.uuid) {
                         NAME_CHAR_UUID -> {
                             tempName = String(data)
+                            gatt.getService(SERVICE_UUID)?.getCharacteristic(SOS_PAYLOAD_CHAR_UUID)?.let {
+                                gatt.readCharacteristic(it)
+                            }
+                        }
+                        SOS_PAYLOAD_CHAR_UUID -> {
+                            tempPayload = String(data)
                             gatt.getService(SERVICE_UUID)?.getCharacteristic(LOCATION_CHAR_UUID)?.let {
                                 gatt.readCharacteristic(it)
                             }
@@ -214,7 +232,8 @@ class BleMeshManager(private val context: Context, private val onSosReceived: (S
                                 device = gatt.device,
                                 name = tempName ?: "Unknown",
                                 location = tempLocation,
-                                rssi = 0 
+                                rssi = 0,
+                                compressedPayload = tempPayload
                             ))
                             gatt.disconnect()
                         }

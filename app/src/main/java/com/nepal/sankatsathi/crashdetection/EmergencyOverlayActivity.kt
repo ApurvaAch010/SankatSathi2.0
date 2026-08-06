@@ -79,7 +79,9 @@ class EmergencyOverlayActivity : ComponentActivity() {
                         finish()
                     },
                     onTimerFinish = {
-                        sendBroadcast(Intent(ACTION_SOS_CONFIRM))
+                        sendBroadcast(Intent(ACTION_SOS_CONFIRM).apply {
+                            putExtra("G_FORCE", gForce)
+                        })
                     }
                 )
             }

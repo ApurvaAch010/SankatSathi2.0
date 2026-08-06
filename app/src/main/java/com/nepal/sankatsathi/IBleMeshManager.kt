@@ -5,7 +5,7 @@ import android.bluetooth.le.ScanResult
 import kotlinx.coroutines.flow.Flow
 
 interface IBleMeshManager {
-    fun startBroadcasting(userName: String, location: String)
+    fun startBroadcasting(userName: String, location: String, compressedPayload: String? = null)
     fun stopBroadcasting()
     fun startScanning()
     fun stopScanning()
@@ -21,5 +21,6 @@ data class SosDevice(
     val name: String,
     val location: String?,
     val rssi: Int,
-    val timestamp: Long = System.currentTimeMillis()
+    val timestamp: Long = System.currentTimeMillis(),
+    val compressedPayload: String? = null
 )

@@ -105,6 +105,10 @@ import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import com.nepal.sankatsathi.crashdetection.CrashDetectionUtils
 import com.nepal.sankatsathi.goodsamaritan.*
+import com.nepal.sankatsathi.sos.SosPayloadCompressor
+import com.nepal.sankatsathi.sos.SosPayloadCompressor.toCompressedBase64
+import com.nepal.sankatsathi.sos.SosRawData
+import com.nepal.sankatsathi.sos.SosType
 import com.nepal.sankatsathi.ui.theme.SankatSathiTheme
 import java.io.File
 import java.io.FileOutputStream
@@ -189,6 +193,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                         isSOSSent.value = true
                         isCountdownActive.value = false
                         stopAlertSignals()
+                        val gForce = intent.getFloatExtra("G_FORCE", 1.0f)
+                        if (gForce > maxGForceTracked.value) maxGForceTracked.value = gForce
                         executeSOSProtocol()
                     }
                 }
@@ -918,15 +924,30 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             } else {
                 "https://maps.google.com/?q=27.7172,85.3240 (Kathmandu Fallback Center)"
             }
+
+            // --- Low-Bandwidth Compression Protocol Integration ---
+            val sosRawData = SosRawData(
+                type = if (isDisasterSOS.value) SosType.MEDICAL else SosType.VEHICLE_CRASH,
+                timestamp = System.currentTimeMillis(),
+                latitude = location?.latitude ?: 27.7172,
+                longitude = location?.longitude ?: 85.3240,
+                altitude = location?.altitude?.toInt()?.toShort() ?: 0,
+                gForce = maxGForceTracked.value,
+                userId = sharedPreferences.getString("user_phone", "000") ?: "000"
+            )
+            val compressedPayload = sosRawData.toCompressedBase64()
+            Log.d("SankatSathiCompressor", "SOS Payload (Base64): $compressedPayload")
+            Log.d("SankatSathiCompressor", "Raw Binary Size: ${SosPayloadCompressor.compressPayload(sosRawData).size} bytes")
+
             dispatchAlerts(locationString)
-            startBroadcastMesh(locationString)
+            startBroadcastMesh(locationString, compressedPayload)
         }.addOnFailureListener {
             dispatchAlerts("Location Error (GPS Signal Unstable)")
             startBroadcastMesh("Unknown")
         }
     }
 
-    private fun startBroadcastMesh(locationString: String) {
+    private fun startBroadcastMesh(locationString: String, compressedPayload: String? = null) {
         // Activate BLE Mesh Broadcasting with unique user ID and location
         val userName = sharedPreferences.getString("user_name", "User") ?: "User"
         val userPhone = sharedPreferences.getString("user_phone", "000") ?: "000"
@@ -954,7 +975,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         if (hasPermissions(bluetoothPermissions)) {
             checkAndEnableBluetooth()
             // PRIORITIZE BLE FIRST (Broadcasting usually more reliable for initial blip)
-            bleMeshManager.startBroadcasting(broadcastName, locationString)
+            bleMeshManager.startBroadcasting(broadcastName, locationString, compressedPayload)
             
             // DELAY D2D TO ENSURE BLE IS BROADCASTING FIRST AND LOCATION IS STABLE
             Handler(Looper.getMainLooper()).postDelayed({
