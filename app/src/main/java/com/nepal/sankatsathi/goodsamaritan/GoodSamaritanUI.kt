@@ -24,6 +24,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.runtime.saveable.rememberSaveable
+import android.util.Log
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.core.content.FileProvider
 import coil.compose.rememberAsyncImagePainter
 import java.io.File
@@ -147,8 +149,8 @@ fun ReportAccidentDialog(
     var severity by remember { mutableStateOf(Severity.MINOR_INJURY) }
     var description by remember { mutableStateOf("") }
     
-    var capturedImageUri by remember { mutableStateOf<android.net.Uri?>(null) }
-    var tempImageUri by remember { mutableStateOf<android.net.Uri?>(null) }
+    var capturedImageUri by rememberSaveable { mutableStateOf<android.net.Uri?>(null) }
+    var tempImageUri by rememberSaveable { mutableStateOf<android.net.Uri?>(null) }
     
     var isRecording by remember { mutableStateOf(false) }
     var recordedAudioFile by remember { mutableStateOf<File?>(null) }
@@ -253,20 +255,27 @@ fun ReportAccidentDialog(
                     Button(
                         onClick = {
                             try {
-                                val file = File(context.cacheDir, "SOS_${System.currentTimeMillis()}.jpg")
+                                // Use filesDir for better compatibility across devices
+                                val imagePath = File(context.filesDir, "images")
+                                if (!imagePath.exists()) {
+                                    val created = imagePath.mkdirs()
+                                    Log.d("SankatSathi", "Images directory created: $created")
+                                }
+                                
+                                val file = File(imagePath, "SOS_${System.currentTimeMillis()}.jpg")
                                 if (file.exists()) file.delete()
-                                file.createNewFile()
-
+                                
                                 val uri = FileProvider.getUriForFile(
                                     context,
-                                    "${context.packageName}.fileprovider",
+                                    "com.nepal.sankatsathi.fileprovider",
                                     file
                                 )
                                 tempImageUri = uri
                                 cameraLauncher.launch(uri)
+                                Log.d("SankatSathi", "Camera launched successfully with URI: $uri")
                             } catch (e: Exception) {
-                                e.printStackTrace()
-                                android.widget.Toast.makeText(context, "Camera Error: ${e.message}", android.widget.Toast.LENGTH_SHORT).show()
+                                Log.e("SankatSathi", "CRITICAL: Camera Launch Failed", e)
+                                android.widget.Toast.makeText(context, "Camera Error: ${e.localizedMessage}", android.widget.Toast.LENGTH_LONG).show()
                             }
                         }
                     ) {
